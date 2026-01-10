@@ -244,20 +244,11 @@ pub mod zaphwork {
     }
 
     /// Fund the escrow with tokens
-    /// For version=1 (new model): transfers total_amount (worker + fee)
-    /// For version=0 (legacy): transfers worker_amount only
+    /// Transfers total_amount (worker_amount + platform_fee) from client to vault
     pub fn fund_escrow(ctx: Context<FundEscrow>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         require!(escrow.status == EscrowStatus::Created, EscrowError::InvalidStatus);
-        
         require!(ctx.accounts.client.key() == escrow.client, EscrowError::Unauthorized);
-
-        // Determine transfer amount based on escrow version
-        let transfer_amount = if escrow.version == 1 {
-            escrow.total_amount  // New model: transfer total (worker + fee)
-        } else {
-            escrow.worker_amount // Legacy model: transfer worker amount only
-        };
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.client_token_account.to_account_info(),
@@ -265,14 +256,14 @@ pub mod zaphwork {
             authority: ctx.accounts.client.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-        token::transfer(cpi_ctx, transfer_amount)?;
+        token::transfer(cpi_ctx, escrow.total_amount)?;
 
         escrow.status = EscrowStatus::Funded;
         escrow.funded_at = Some(Clock::get()?.unix_timestamp);
 
         emit!(EscrowFunded {
             escrow: escrow.key(),
-            amount: transfer_amount,
+            amount: escrow.total_amount,
             funded_at: escrow.funded_at.unwrap(),
         });
 
@@ -280,29 +271,15 @@ pub mod zaphwork {
     }
 
     /// Release escrow to worker (client approves)
-    /// For version=1 (new model): worker gets worker_amount, treasury gets (total_amount - worker_amount)
-    /// For version=0 (legacy): fee is calculated from worker_amount, worker gets remainder
+    /// Worker gets worker_amount, treasury gets platform fee (total_amount - worker_amount)
     pub fn release_escrow(ctx: Context<ReleaseEscrow>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         require!(escrow.status == EscrowStatus::Funded, EscrowError::InvalidStatus);
         require!(ctx.accounts.client.key() == escrow.client, EscrowError::Unauthorized);
 
-        // Calculate amounts based on escrow version
-        let (worker_payout, platform_fee) = if escrow.version == 1 {
-            // New model: worker gets full worker_amount, fee is the difference
-            let fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
-            (escrow.worker_amount, fee)
-        } else {
-            // Legacy model: calculate fee from worker_amount, worker gets remainder
-            let fee = calculate_fee(escrow.worker_amount, escrow.platform_fee_bps)?;
-            let worker_payout = escrow.worker_amount.checked_sub(fee).ok_or(EscrowError::Overflow)?;
-            (worker_payout, fee)
-        };
-
-        // Verify vault has sufficient balance before transfer
-        let expected_balance = if escrow.version == 1 { escrow.total_amount } else { escrow.worker_amount };
-        let vault_balance = ctx.accounts.vault.amount;
-        require!(vault_balance >= expected_balance, EscrowError::InsufficientFunds);
+        // Worker gets full worker_amount, fee is the difference
+        let worker_payout = escrow.worker_amount;
+        let platform_fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
 
         let escrow_id_bytes = escrow.escrow_id.to_le_bytes();
         let seeds = &[ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow_id_bytes, &[escrow.bump]];
@@ -354,10 +331,8 @@ pub mod zaphwork {
     }
 
     /// Admin release to worker (dispute resolution)
-    /// Platform ALWAYS retains its fee during dispute resolution.
-    /// This covers the cost of adjudication regardless of outcome.
-    /// For version=1: worker receives worker_amount, treasury receives (total_amount - worker_amount)
-    /// For version=0: worker receives (worker_amount - fee), treasury receives fee
+    /// Worker wins dispute - gets worker_amount, platform gets fee.
+    /// Platform retains fee when worker is awarded the funds.
     pub fn admin_release_to_worker(ctx: Context<AdminActionCtx>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         let config = &ctx.accounts.config;
@@ -367,37 +342,22 @@ pub mod zaphwork {
         // Verify escrow was actually funded before admin action
         require!(escrow.funded_at.is_some(), EscrowError::NotFunded);
 
-        // Platform ALWAYS keeps fee - calculate amounts
-        let (worker_payout, platform_fee) = if escrow.version == 1 {
-            // v1: worker gets worker_amount, treasury gets the fee (total - worker)
-            let fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
-            (escrow.worker_amount, fee)
-        } else {
-            // v0: calculate fee from worker_amount, worker gets remainder
-            let fee = calculate_fee(escrow.worker_amount, escrow.platform_fee_bps)?;
-            let worker_payout = escrow.worker_amount.checked_sub(fee).ok_or(EscrowError::Overflow)?;
-            (worker_payout, fee)
-        };
-
-        // Verify vault has sufficient balance before transfer
-        let expected_balance = if escrow.version == 1 { escrow.total_amount } else { escrow.worker_amount };
-        let vault_balance = ctx.accounts.vault.amount;
-        require!(vault_balance >= expected_balance, EscrowError::InsufficientFunds);
+        // Worker wins - gets worker_amount, platform gets fee
+        let worker_payout = escrow.worker_amount;
+        let platform_fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
 
         let escrow_id_bytes = escrow.escrow_id.to_le_bytes();
         let seeds = &[ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow_id_bytes, &[escrow.bump]];
         let signer_seeds = &[&seeds[..]];
 
         // Transfer to worker
-        if worker_payout > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.worker_token_account.to_account_info(),
-                authority: escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
-            token::transfer(cpi_ctx, worker_payout)?;
-        }
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.vault.to_account_info(),
+            to: ctx.accounts.worker_token_account.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
+        token::transfer(cpi_ctx, worker_payout)?;
 
         // Transfer fee to treasury
         if platform_fee > 0 {
@@ -418,11 +378,10 @@ pub mod zaphwork {
     }
 
     /// Admin refund to client (dispute resolution)
-    /// Platform ALWAYS retains its fee during dispute resolution.
-    /// This covers the cost of adjudication regardless of outcome.
-    /// For version=1: client receives worker_amount, treasury receives (total_amount - worker_amount)
-    /// For version=0: client receives (worker_amount - fee), treasury receives fee
-    pub fn admin_refund_to_client(ctx: Context<AdminActionCtx>) -> Result<()> {
+    /// Client wins dispute - gets FULL refund including platform fee.
+    /// Platform absorbs the cost when client is not at fault.
+    /// For version=1: client receives total_amount (worker_amount + fee)
+    pub fn admin_refund_to_client(ctx: Context<AdminRefundCtx>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         let config = &ctx.accounts.config;
         
@@ -431,48 +390,21 @@ pub mod zaphwork {
         // Verify escrow was actually funded before admin action
         require!(escrow.funded_at.is_some(), EscrowError::NotFunded);
 
-        // Platform ALWAYS keeps fee - calculate amounts
-        let (client_refund, platform_fee) = if escrow.version == 1 {
-            // v1: client gets worker_amount, treasury gets the fee (total - worker)
-            let fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
-            (escrow.worker_amount, fee)
-        } else {
-            // v0: calculate fee from worker_amount, client gets remainder
-            let fee = calculate_fee(escrow.worker_amount, escrow.platform_fee_bps)?;
-            let client_refund = escrow.worker_amount.checked_sub(fee).ok_or(EscrowError::Overflow)?;
-            (client_refund, fee)
-        };
-
-        // Verify vault has sufficient balance before transfer
-        let expected_balance = if escrow.version == 1 { escrow.total_amount } else { escrow.worker_amount };
-        let vault_balance = ctx.accounts.vault.amount;
-        require!(vault_balance >= expected_balance, EscrowError::InsufficientFunds);
+        // Client wins dispute - full refund (no fee taken)
+        let client_refund = escrow.total_amount;
 
         let escrow_id_bytes = escrow.escrow_id.to_le_bytes();
         let seeds = &[ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow_id_bytes, &[escrow.bump]];
         let signer_seeds = &[&seeds[..]];
 
-        // Transfer to client
-        if client_refund > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.client_token_account.to_account_info(),
-                authority: escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
-            token::transfer(cpi_ctx, client_refund)?;
-        }
-
-        // Transfer fee to treasury
-        if platform_fee > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.treasury_token_account.to_account_info(),
-                authority: escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
-            token::transfer(cpi_ctx, platform_fee)?;
-        }
+        // Transfer full amount to client
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.vault.to_account_info(),
+            to: ctx.accounts.client_token_account.to_account_info(),
+            authority: escrow.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
+        token::transfer(cpi_ctx, client_refund)?;
 
         escrow.status = EscrowStatus::Refunded;
         escrow.refunded_at = Some(Clock::get()?.unix_timestamp);
@@ -482,8 +414,7 @@ pub mod zaphwork {
     }
 
     /// Refund escrow to client (deadline passed)
-    /// For version=1 (new model): refunds total_amount (worker + fee)
-    /// For version=0 (legacy): refunds worker_amount only
+    /// Refunds total_amount (worker_amount + platform_fee) to client
     pub fn refund_escrow(ctx: Context<RefundEscrow>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         
@@ -493,17 +424,6 @@ pub mod zaphwork {
         let deadline = escrow.deadline.ok_or(EscrowError::NoDeadlineSet)?;
         let current_time = Clock::get()?.unix_timestamp;
         require!(current_time > deadline, EscrowError::DeadlineNotPassed);
-
-        // Determine refund amount based on escrow version
-        let refund_amount = if escrow.version == 1 {
-            escrow.total_amount  // New model: refund total (worker + fee)
-        } else {
-            escrow.worker_amount // Legacy model: refund worker amount only
-        };
-
-        // Verify vault has sufficient balance before transfer
-        let vault_balance = ctx.accounts.vault.amount;
-        require!(vault_balance >= refund_amount, EscrowError::InsufficientFunds);
 
         let escrow_id_bytes = escrow.escrow_id.to_le_bytes();
         let seeds = &[ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow_id_bytes, &[escrow.bump]];
@@ -515,12 +435,12 @@ pub mod zaphwork {
             authority: escrow.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
-        token::transfer(cpi_ctx, refund_amount)?;
+        token::transfer(cpi_ctx, escrow.total_amount)?;
 
         escrow.status = EscrowStatus::Refunded;
         escrow.refunded_at = Some(Clock::get()?.unix_timestamp);
 
-        emit!(EscrowRefunded { escrow: escrow.key(), client: escrow.client, amount: refund_amount, refunded_at: escrow.refunded_at.unwrap(), reason: "deadline_passed".to_string() });
+        emit!(EscrowRefunded { escrow: escrow.key(), client: escrow.client, amount: escrow.total_amount, refunded_at: escrow.refunded_at.unwrap(), reason: "deadline_passed".to_string() });
         Ok(())
     }
 
@@ -568,8 +488,7 @@ pub mod zaphwork {
     /// This covers the cost of adjudication regardless of outcome.
     /// NOTE: Uses basis points (0-10000) for precision. 5000 = 50% to worker.
     /// Any remainder from integer division goes to the client (who funded the escrow).
-    /// For version=1: fee = (total_amount - worker_amount), split worker_amount between parties
-    /// For version=0: fee = calculate_fee(worker_amount), split remainder between parties
+    /// Fee = (total_amount - worker_amount), split worker_amount between parties
     pub fn admin_split_funds(ctx: Context<AdminSplit>, worker_bps: u64) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         let config = &ctx.accounts.config;
@@ -581,21 +500,8 @@ pub mod zaphwork {
         require!(worker_bps <= BPS_DENOMINATOR, EscrowError::InvalidPercentage);
 
         // Platform ALWAYS keeps fee - calculate amounts
-        let (split_base, platform_fee) = if escrow.version == 1 {
-            // v1: fee is (total - worker), split worker_amount between parties
-            let fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
-            (escrow.worker_amount, fee)
-        } else {
-            // v0: calculate fee from worker_amount, split remainder between parties
-            let fee = calculate_fee(escrow.worker_amount, escrow.platform_fee_bps)?;
-            let split_base = escrow.worker_amount.checked_sub(fee).ok_or(EscrowError::Overflow)?;
-            (split_base, fee)
-        };
-
-        // Verify vault has sufficient balance before transfer
-        let expected_balance = if escrow.version == 1 { escrow.total_amount } else { escrow.worker_amount };
-        let vault_balance = ctx.accounts.vault.amount;
-        require!(vault_balance >= expected_balance, EscrowError::InsufficientFunds);
+        let platform_fee = escrow.total_amount.checked_sub(escrow.worker_amount).ok_or(EscrowError::Overflow)?;
+        let split_base = escrow.worker_amount;
 
         // Calculate worker amount using basis points (0-10000) from split_base (after fee)
         // Use u128 to prevent overflow during multiplication
@@ -787,6 +693,11 @@ pub mod zaphwork {
             pool_escrow.status == PoolEscrowStatus::Active,
             EscrowError::InvalidStatus
         );
+
+        // Verify deadline hasn't passed (if set)
+        if let Some(dl) = pool_escrow.deadline {
+            require!(Clock::get()?.unix_timestamp <= dl, EscrowError::DeadlinePassed);
+        }
 
         // Verify we haven't exceeded max releases
         require!(pool_escrow.release_count < pool_escrow.max_releases, EscrowError::MaxReleasesReached);
@@ -1246,6 +1157,23 @@ pub struct AdminActionCtx<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Context for admin refund to client (dispute resolution - client wins)
+/// Simpler than AdminActionCtx - no treasury needed since client gets FULL refund
+#[derive(Accounts)]
+pub struct AdminRefundCtx<'info> {
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ EscrowError::Unauthorized)]
+    pub config: Account<'info, PlatformConfig>,
+    #[account(mut, seeds = [ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow.escrow_id.to_le_bytes()], bump = escrow.bump, has_one = vault @ EscrowError::InvalidVault)]
+    pub escrow: Account<'info, EscrowAccount>,
+    #[account(mut, seeds = [VAULT_SEED, escrow.key().as_ref()], bump = escrow.vault_bump)]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(mut, token::mint = escrow.mint, token::authority = escrow.client)]
+    pub client_token_account: Account<'info, TokenAccount>,
+    pub admin: Signer<'info>,
+    #[account(address = token::ID)]
+    pub token_program: Program<'info, Token>,
+}
+
 #[derive(Accounts)]
 pub struct RefundEscrow<'info> {
     #[account(mut, seeds = [ESCROW_SEED, escrow.client.as_ref(), escrow.worker.as_ref(), &escrow.escrow_id.to_le_bytes()], bump = escrow.bump, has_one = client @ EscrowError::Unauthorized, has_one = vault @ EscrowError::InvalidVault)]
@@ -1640,4 +1568,6 @@ pub enum EscrowError {
     InvalidWorkerAddress,
     #[msg("Invalid platform authority address")]
     InvalidPlatformAuthority,
+    #[msg("Deadline has passed - no more releases allowed")]
+    DeadlinePassed,
 }
