@@ -1,0 +1,23 @@
+# Rust/Cargo
+target/
+Cargo.lock
+
+# Anchor
+.anchor/
+test-ledger/
+
+# IDL (generated)
+# Keep idl/ if you want to include it
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

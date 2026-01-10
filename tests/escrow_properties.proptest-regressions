@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 04dd1c806db81e693dd77d6d6b5751da6a309f7cd8f36b237b6ea42124c56ba2 # shrinks to platform_fee = 7, client_commission_percent = 58, worker_commission_percent = 58
+cc 70545862b65dbb3f5c4d1a0015a57764c10b4da10bd142fc31ba8954b26c6202 # shrinks to transaction_amount = 14, platform_fee_percent = 22, client_commission_percent = 67, worker_commission_percent = 67
