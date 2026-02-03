@@ -5,7 +5,7 @@ A secure, trustless escrow smart contract for freelance payments on Solana. Buil
 ## Features
 
 - **PDA-based Escrows** - Each escrow is a Program Derived Address for security
-- **Hardcoded Fees** - 10% for tasks/gigs, 5% for jobs (cannot be changed by admin)
+- **Split-Based Settlement** - Flexible payment distribution to multiple recipients (up to 8)
 - **Two-Step Admin Transfer** - Secure admin role transfer with propose/accept pattern
 - **Dispute Resolution** - Freeze, admin release, admin refund, and split funds
 - **Pool Escrows** - Multi-worker task support for crowdsourcing/microtasks
@@ -60,20 +60,12 @@ cargo test
 
 ## Security Features
 
-- **Hardcoded fees** - Admin cannot change fee percentages
+- **Split validation** - Ensures splits sum to 100% and no duplicates
 - **Worker pubkey validation** - Validates addresses are on ed25519 curve
 - **Deadline limits** - Max 1 year deadline to prevent unrealistic escrows
 - **Duplicate account checks** - Prevents same account used for multiple roles
 - **Overflow protection** - Uses u128 intermediate calculations
 - **Rent recovery** - `close = client` on account closures
-
-## Fee Structure
-
-| Type | Fee |
-|------|-----|
-| Tasks/Gigs/Projects | 10% (1000 bps) |
-| Employment/Jobs | 5% (500 bps) |
-| Minimum Escrow | 1 USDC |
 
 ## License
 
@@ -81,7 +73,6 @@ MIT License - see [LICENSE](LICENSE)
 
 ## About ZaphWork
 
-ZaphWork is a decentralized freelance platform built on Solana. This escrow contract handles all payment flows between clients and workers.
+ZaphWork is a decentralized freelance platform built on Solana blockchain. This escrow contract handles all payment flows between clients and workers.
 
 - Website: [zaph.work](https://zaph.work)
-- Main Repository: Private (this is the open-source smart contract only)
